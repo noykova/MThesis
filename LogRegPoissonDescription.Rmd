@@ -1,0 +1,539 @@
+---
+title: "The simplest models of logistic and Poisson regressions using tabulated subset data"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Logistic regession model
+
+## Model description
+This simplest model describes only presence or absence of whitefish larvae $y$, not its density. Here the observational model is described as Bernoulli distribution given as: 
+
+$$y_i |m_i \sim  Bernoulli(g^{-1}(m_i(x_i))),$$ 
+
+where we assume logit transformation of the mean function $m(x)$
+
+$$g(m_i(x_i))= logit(m_i(x_i)) = log\left(\frac{m_i(x_i)}{1-m_i(x_i)}\right)
+$$
+
+The mean function $m(x)$ follows the logistic regression model: 
+
+ $$m(x) = logit^{-1}(\alpha_0 + \alpha_1\delta_1(x_1)+ ... + \alpha_6x_6(x_1) + x_2\beta_1 + ... + x_6\beta_5). $$
+ 
+ In this model: 
+ 
+ $\delta_d(x_1)=1$ if $x_1=d$ and zero otherwise, $\alpha_d \sim N(0,10)$ and $\beta_d \sim N(0,10), 0, ..., 5$
+
+The priors are defined as: 
+
+$$\alpha_d \sim N(0,10)$$ and 
+$$\beta_d \sim N(0,10), d=0, ..., 5$$
+
+The posterior distribution: 
+
+$$p(\alpha_0, \alpha_1, ..., \alpha_6, \beta_1, ... ,\beta_5 | y,x) = p(\alpha_0)p(\alpha_l) ... p(\alpha_6)p(\beta_1)...p(\beta_5)\prod_{i=1}^{n}p(y_i | \alpha_0,\alpha_1, ..., \alpha_5,\beta_1, ... ,\beta_5, x_i)$$
+
+## Visualizing the study area and two environmental variables
+
+We start with loading the smaller subset data (in tabular format) and visualizing the study area. 
+First we plot the variable Distance to 20m deep water at the sampling locations. The locations of samling sites are marked in black. 
+
+```{r}
+setwd("D:/Neli/MThesis/Ex_7_trials")
+
+if (.Platform$OS.type != "windows") {
+  if (Sys.getenv("RSTUDIO") == "1") {
+    windows <- function( ... ) X11( ... )
+  } else {
+    windows <- dev.new
+  }
+}
+
+library("rstan")
+library(matrixStats)
+options(mc.cores = parallel::detectCores())
+
+library("raster")
+library(Rcpp)
+# Load the data
+whitefish.dat = read.table("data_whitefish.txt", header=TRUE, sep="\t")
+whitefish.raster = read.table("predraster_whitefish.txt", header=TRUE, sep="\t")
+
+## The coordinate system in the data is ETRS89.  
+## This is a 3D cartesian coordinate system constructed specifically to European areas. 
+##  In whitefish.dat the coordinates are N_etrs89 E_etrs89
+##  In whitefish.raster the coordinates are X Y                 
+
+# First examine the data by plotting few of the raster layers 
+
+# Visualize few environmental covariates
+e <- extent(cbind(whitefish.raster$X,whitefish.raster$Y))
+r <- raster(e, ncol=length(unique(whitefish.raster$X)), nrow=length(unique(whitefish.raster$Y)))
+
+z <- rasterize(cbind(whitefish.raster$X,whitefish.raster$Y), r, whitefish.raster$DIST20M, fun=mean)
+plot(z, xlim=cbind(min(whitefish.raster$X),max(whitefish.raster$X)),
+     ylim=cbind(min(whitefish.raster$Y),max(whitefish.raster$Y)), main="Distance to 20m deep water")
+
+# Plot the locations of sampling sites
+points(whitefish.dat$E_etrs89,whitefish.dat$N_etrs89)
+
+
+```
+
+The last ice cover day in 2009 at sampling locations is visualized on the next plot: 
+
+```{r}
+# Plot Last ice cover day in 2009
+z <- rasterize(cbind(whitefish.raster$X,whitefish.raster$Y), r, whitefish.raster$ICELAST09, fun=mean)
+plot(z, xlim=cbind(min(whitefish.raster$X),max(whitefish.raster$X)),
+     ylim=cbind(min(whitefish.raster$Y),max(whitefish.raster$Y)), main="Last ice cover day in 2009")
+# Plot the locations of sampling sites
+points(whitefish.dat$E_etrs89,whitefish.dat$N_etrs89)
+
+```
+
+
+## Performing logistic regression using Stan. 
+
+The environmental covariates are: 
+
+BOTTOMCLS - Bottom type classifiction, a categorical variable with  the following classes:
+  0 = not shallow
+  1 = open water
+  2 = other
+  3 = sand
+  4 = sand/mud
+  5 = sand/stone
+
+DIS_SAND  - distance to sandy shore, continuous variable
+
+FE300ME   - The average fetch (opennes/exposure) over all directions, continuous variable
+
+ICELAST09 - The last ice cover date in winter 2009-10, continuous variable
+
+RIVERS    - Influence of rivers (~weighted average distance to river mouths), continuous variable
+
+SAL910WIN - Winter salinity in 2009-2010, continuous variable
+
+The output variable is
+  WHISUM - the number of whitefishes caught in sampling occasion. 
+
+In this simplest case we model only presence or absence of whitefish, because of which we transform it to 0/1 binary variable. 
+
+First we set up an standardize the data and prediction varables.
+
+```{r}
+# Set up data
+s = as.matrix(cbind(whitefish.dat$E_etrs89,whitefish.dat$N_etrs89)) / 1000   # spatial coordinates in km
+x = matrix(0,nrow=nrow(s),ncol=12)      # intercept + 6 BOTTOMCLS classes + 5 continues covariates
+x[,1] = 1                             # Set the column corresponding to intercept to 1
+x[whitefish.dat$BOTTOMCLS==0,2] = 1   # Set the elements corresponding to BOTTOMCLS = 0 to 1
+x[whitefish.dat$BOTTOMCLS==1,3] = 1   # Set the elements corresponding to BOTTOMCLS = 1 to 1
+x[whitefish.dat$BOTTOMCLS==2,4] = 1   # Set the elements corresponding to BOTTOMCLS = 2 to 1
+x[whitefish.dat$BOTTOMCLS==3,5] = 1   # Set the elements corresponding to BOTTOMCLS = 3 to 1
+x[whitefish.dat$BOTTOMCLS==4,6] = 1   # Set the elements corresponding to BOTTOMCLS = 4 to 1
+x[whitefish.dat$BOTTOMCLS==5,7] = 1   # Set the elements corresponding to BOTTOMCLS = 5 to 1
+xcont = as.matrix(cbind(whitefish.dat$DIS_SAND,
+                        whitefish.dat$FE300ME,
+                        whitefish.dat$ICELAST09,
+                        whitefish.dat$RIVERS,
+                        whitefish.dat$SAL910WIN))
+stdxcont = apply(xcont, 2, sd)
+mxcont = apply(xcont, 2, mean)
+x[,8:12] = t( apply( t(apply(xcont,1,'-',mxcont)),1,'/',stdxcont) )    # "standardize" the continuous covariates
+
+# End variable
+#transform WHISUM to binary: 0 if 0, 1 otherwise
+y1<-whitefish.dat$WHISUM
+whitefish.dat$WHISUM[whitefish.dat$WHISUM > 0] <- 1
+y = whitefish.dat$WHISUM               # number of counted fish larvae
+#head(y)
+#tail(y)
+
+# Prediction variables
+spred = as.matrix(cbind(whitefish.raster$X,whitefish.raster$Y)) / 1000  # spatial coordinates in km
+xpred = matrix(0,nrow=nrow(spred),ncol=12)      # intercept + 6 BOTTOMCLS classes + 5 continues covariates
+xpred[,1] = 1                             # Set the column corresponding to intercept to 1
+xpred[whitefish.raster$BOTTOMCLS==0,2] = 1   # Set the elements corresponding to BOTTOMCLS = 0 to 1
+xpred[whitefish.raster$BOTTOMCLS==1,3] = 1   # Set the elements corresponding to BOTTOMCLS = 1 to 1
+xpred[whitefish.raster$BOTTOMCLS==2,4] = 1   # Set the elements corresponding to BOTTOMCLS = 2 to 1
+xpred[whitefish.raster$BOTTOMCLS==3,5] = 1   # Set the elements corresponding to BOTTOMCLS = 3 to 1
+xpred[whitefish.raster$BOTTOMCLS==4,6] = 1   # Set the elements corresponding to BOTTOMCLS = 4 to 1
+xpred[whitefish.raster$BOTTOMCLS==5,7] = 1   # Set the elements corresponding to BOTTOMCLS = 5 to 1
+xpredcont = as.matrix(cbind(whitefish.raster$DIS_SAND,
+                            whitefish.raster$FE300ME,
+                            whitefish.raster$ICELAST09,
+                            whitefish.raster$RIVERS,
+                            whitefish.raster$SAL910WIN))
+xpred[,8:12] = t( apply( t(apply(xpredcont,1,'-',mxcont)),1,'/',stdxcont) )    # "standardize" the continuous covariates
+
+dim(x)
+length(y)
+```
+The Stan hierarchical model of logistic regression is given in the chunk bellow. 
+We have used  y ~ bernoulli_logit((x.beta)) instead y ~ bernoulli(inv_logit(x.beta)) since the function **bernoulli_logit** is numerically stable. 
+
+
+```{stan output.var="Log_reg_whitefish"}
+data {
+  int<lower=1> N; //number of observations
+  int<lower=1> Dx; //number of predictors + first column = intercept alpha_0
+  matrix[N,Dx] x; //covariate matrix
+  int<lower=0> y[N];
+}
+
+parameters {
+  vector [Dx] beta;
+}
+
+model {
+  //priors for alpha and beta coefficients 
+  //all alpha and beta coefficients are involved in beta column vector
+  //beta =[alpha0, alpha1, ..., alpha6,beta1,...,beta5]
+  //Set week priors for intercept and all other covariates
+  for (i in 1:Dx)
+    beta[i] ~ normal(0, 10);
+    
+  //the likelihood  
+  //y ~ bernoulli(inv_logit(x*beta)); - does not work; not stable numercally
+  y ~ bernoulli_logit((x*beta));
+}
+
+
+```
+
+
+
+Next we simulate and analyze the Stan model using MCMC simulations and statistics. We start 4 initial chains and check their mixing and convergence properties. 
+
+```{r}
+ #x = x[seq(1,217,length=60),]
+ #y = y[seq(1,217,length=60)]
+
+whitefish_dat <- list(Dx = ncol(x),
+                      N = nrow(x),
+                      x = x,
+                      y = y)
+
+#set initial values of the chains
+#rnorm(#samples, mu,sigma)
+set.seed(124)
+#init1 <-list(beta=as.vector(rep(0,ncol(x))))
+init1 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+init2 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+init3 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+init4 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+inits = list(init1,init2,init3,init4)
+
+# Compile the STAN model
+library(rstudioapi)
+fit <- stan(file = "Log_reg_whitefish.stan", data = whitefish_dat, warmup=200,
+            iter = 1000, init=inits , control = list(adapt_delta = 0.99), pars=c("beta"))
+beta <- as.matrix(fit)
+
+print(fit)  
+#lp_ ->log density up to a constant 
+# https://www.jax.org/news-and-insights/jax-blog/2015/october/lp-in-stan-output
+#log density = log likelihood of the observations conditioned on the posterior parameters: p(y | p_post). 
+
+```
+
+We see that the potential scale reduction factor ***Rhat=1*** for all scalar beta estimates, as it should be for convergent multivariate distribution in the limit $n \rightarrow \infty$. The effective sample size ***n_eff*** is related to the precision obtained from the simulations. By one emperical rule (Gelman, Carlin, Stern, Dunson, Vehtari, and Rubin (2013). Bayesian Data Analysis, third edition. CRC Press.) $n_{eff} = 5.m$, where $m$ is twice the number of sequences, here $m=8$ and $n_{eff} = 40$. We see that here all $n_{eff} > 40$. 
+
+A summary statistics of every chain is shown bellow:
+```{r}
+summary(fit) 
+```
+
+We continue to analyse MCMC convergence by visual analysis of mixing and stationarity via taceplots of all $\beta$ parameters. 
+
+```{r}
+#parameter's matrix:
+b <- as.matrix(fit)
+beta<-b[,-13]
+colnames(beta)<-c("alpha_0","alpha_1","alpha_2","alpha_3","alpha_4","alpha_5","alpha_6","beta_1","beta_2","beta_3","beta_4","beta_5")
+
+stan_trace(fit, pars = c("beta"))
+```
+
+These plots show good mixing of all chains and therefore we can conclude that the convergence is achieved. 
+
+Posterior densities and histograms of all estimated $\beta$ are: 
+```{r}
+#posterior densties and histograms
+stan_hist(fit, pars='beta', bins=30)
+```
+
+The credible intervals of all $\beta$ estimates are:
+
+```{r}
+#show credible intervals
+plot(fit, show_density = FALSE, ci_level = 0.5, outer_level = 0.95, fill_color = "salmon", pars='beta')
+
+```
+Pairwise correlations between estimated $\beta$ are:
+
+```{r}
+#pairwise correlations
+pairs(fit)
+
+```
+
+The autocorrelation between all beta and is: 
+
+```{r}
+#par(mar = c(1, 1, 1, 1)) # Set the margin on all sides to 6
+acf(beta)
+```
+Thinned paramters and theirs mean values: 
+
+```{r}
+beta_thinned = as.matrix(beta[seq(1,800,4),])
+#dim(beta_thinned)
+#head(beta_thinned)
+#mean estimates
+means_b = colMeans(beta_thinned)
+means_b
+```
+
+
+## Test model accuracy
+
+Here we make model predictions from Stan model in R. 
+[Here ](https://medium.com/@alex.pavlakis/making-predictions-from-stan-models-in-r-3e349dfac1ed) 3 ways to make predictions are described: 
+1.	Predict outside Stan: use estimated posteriors in Stan to build the model and generate the output outside Stan, in R. 
+2.	Predict with Stan: define only data (x_test + estimated parameters)  and generated quantities (define output y_test). Model and parameter parts are empty.  
+3.	Fit-and-predict: except data (x_train, x_test, y_train), model (y_train) and paraeter parts I n Stan we define also y_test in generated quantities.  
+
+Here we apply the first approach. 
+We use log regression model in R to simulate y~predicted~. Use MCMC parameter estimates for beta (from x,y data) and x~predicted~ to obtain y~predicted~. 
+
+We first take random sample from all estimated $\beta$, all train x data, and simulate the logistic regression model in R to obtain y~pred~: 
+
+```{r}
+lin_comb <- x%*%t(beta)
+#prob of success
+#prob==prob1
+prob <- 1/(1 + exp(-lin_comb))
+#prob1 <- exp(lin_comb)/(1 + exp(lin_comb))
+#dim(x)[1] - number of observations we want to see
+# # of trials per observation = 1 = Bernoulli
+#prob - prob of success of each trial, dim(prob) = 217x3200
+set.seed(56)
+#dim(prob)=217x3200
+y_pred <- rbinom(dim(x)[1], 1, prob)
+# Accuracy
+mean(y_pred == y)
+
+```
+We repeat the same procedure for estimating the accuracy using train data, but now usng thinned $\beta$ estimates: 
+
+```{r}
+#1.2 test model accuracy via r using thinned beta estimates
+lin_comb_bt <- x%*%t(beta_thinned)
+prob_bt <- 1/(1 + exp(-lin_comb_bt))
+set.seed(123)
+y_pred_bt<- rbinom(dim(x)[1], 1, prob_bt)
+# Accuracy
+mean(y_pred_bt == y)
+
+#CONCLUSION: THE ACCURACY WHEN USE THINNED ESTIMATES IS BETTER
+
+
+```
+
+
+Conclusion: The acuracy when use thinned parameter estimates $\beta_{thinned}$ is better. 
+
+# Question: how to choose y_predicted, which to compare to original y_data? We have y_predicted(n,m), where m is the number of MCMC simulations = 3200. When I use beta_thinned (m,12), m=200 values, the accuracy results are better. 
+
+
+## Visualizing predictions for whitefish larvae presence using the predicted covariates $x_{pred}$
+
+First we compute the predicted values $y_{pred}$ using the $x_{pred}$ covariates: 
+
+```{r}
+lin_comb_bt <- xpred%*%t(beta_thinned)
+prob_bt <- 1/(1 + exp(-lin_comb_bt))
+set.seed(123)
+y_pred_bt<- rbinom(dim(xpred)[1], 1, prob_bt)
+```
+Next visualize these values about whitefish presence: 
+
+```{r}
+z <- rasterize(cbind(whitefish.raster$X,whitefish.raster$Y), r, y_pred_bt, fun=mean)
+plot(z, xlim=cbind(min(whitefish.raster$X),max(whitefish.raster$X)),
+     ylim=cbind(min(whitefish.raster$Y),max(whitefish.raster$Y)), main="White fish larvae (presence=1/absence=0)")
+
+```
+
+# The Poison log-linear mopdel using Stan log-parametrization
+
+The model in Stan: 
+
+
+```{stan output.var="Poisson_reg_whitefish"}
+data {
+  int<lower=1> N; //number of observations
+  int<lower=1> Dx; //number of predictors + first column = intercept alpha_0
+  matrix[N,Dx] x; //covariate matrix
+  int<lower=0> y[N];
+}
+
+parameters {
+  vector [Dx] beta;
+}
+
+model {
+  //priors for alpha and beta coefficients 
+  //all alpha and beta coefficients are involved in beta column vector
+  //beta =[alpha0, alpha1, ..., alpha6,beta1,...,beta5]
+  //Set week priors for intercept and all other covariates
+  for (i in 1:Dx)
+    beta[i] ~ normal(0, 10);
+    
+  //the likelihood  
+  //y ~ poisson_log(log_theta), log_theta = x*beta
+  y ~ poisson_log((x*beta));
+}
+
+//define log_lik to be usd in LOO CV 
+generated quantities {
+  vector[N] log_lik;
+  for (n in 1:N) {
+    //probability mass function 
+    //Increment target log probability density with poisson_log_lpmf( n | log_theta) 
+    //dropping constant additive terms.
+    log_lik[n] = poisson_log_lpmf(y[n] | x[n] * beta);
+  }
+}
+
+```
+
+We repeat the same step of model analysis as in logistic regression model. We again start start 4 initial chains and check their mixing and convergence properties. Look the summary of the results, check Rhat vallues and effective sizes, and plot some important dependences.  
+
+```{r}
+whitefish_dat <- list(Dx = ncol(x),
+                      N = nrow(x),
+                      x = x,
+                      y = y1)
+set.seed(124)
+#init1 <-list(beta=as.vector(rep(0,ncol(x))))
+init1 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+init2 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+init3 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+init4 <- list(beta=as.vector(rnorm(ncol(x),0,10)))
+inits = list(init1,init2,init3,init4)
+
+# Compile the STAN model
+#if we want to have an access to the generated quantities, we have to omit pars - argument
+fit <- stan(file = "Poisson_reg_whitefish.stan", data = whitefish_dat, warmup=300,
+            iter = 1100, init=inits , control = list(max_treedepth = 15), pars=c("beta")) #control = list(adapt_delta = 0.99)
+
+windows()
+print(fit)              
+summary(fit)            # summary
+stan_trace(fit, pars = c("beta"))         # traceplot
+#posterior densties and histograms
+stan_dens(fit, pars='beta')
+stan_hist(fit, pars='beta', bins=30)
+#show credible intervals
+plot(fit, show_density = FALSE, ci_level = 0.5, outer_level = 0.95, fill_color = "salmon", pars='beta')
+#pairwise correlations
+pairs(fit)
+
+#parameter's matrix:
+b <- as.matrix(fit)
+beta<-b[,-13]
+colnames(beta)<-c("alpha_0","alpha_1","alpha_2","alpha_3","alpha_4","alpha_5","alpha_6","beta_1","beta_2","beta_3","beta_4","beta_5")
+
+```
+
+```{r}
+#plot autocorrelation function of all alpha and beta parameters:
+#acf(b)
+acf(beta)
+```
+```{r}
+# posterior density of parameters beta - histograms
+quietgg(h <- stan_hist(fit, pars = "beta"))
+```
+```{r}
+beta_thinned = as.matrix(beta[seq(1,800,4),])
+dim(beta_thinned)
+head(beta_thinned)
+#mean estimates
+means_b = colMeans(beta_thinned)
+means_b
+
+```
+```{r}
+#plot pairwise (auto)correlations
+acf(beta_thinned)
+```
+## Test model accuracy
+
+We use posterior $\beta$ estimates and the data about covariates $x$ to simulate predicted $y$ values using samples generated in R. First we use all $\beta$ estimates: 
+
+```{r}
+set.seed(78)
+lin_comb <- x%*%t(beta)
+#lambda = exp(lin_comb); Stan: alpha = log(lambda)=lin_comb
+lambda <- exp(lin_comb)
+#rpois(n,lambda), n-number of simulated points
+y_pred <- rpois(dim(x)[1], lambda)
+# Accuracy
+mean(y_pred == y1)
+```
+
+Next we use only $\beta_{thinned}$, 200 simulated values:
+
+```{r}
+#1.2 test model accuracy via r using thinned beta estimates
+set.seed(78)
+lin_comb_bt <- x%*%t(beta_thinned)
+#lambda = exp(lin_comb); Stan: alpha = log(lambda)=lin_comb
+lambda_t <- exp(lin_comb_bt)
+#rpois(n,lambda), n-number of simulated points
+y_pred_t <- rpois(dim(x)[1], lambda_t)
+# Accuracy
+mean(y_pred_t == y1)
+```
+# What is wrong here, why the accuracy is so low?
+
+Conclusion: The accuracy in both cases is the same and very low. 
+
+## Visualizing predictions for whitefish larvae counts using the predicted covariates $x_{pred}$
+
+We predict $y_{pred}$ using the Poisson log regression model in R and covariates data $x_{pred}$, and plot them on the raster:
+
+```{r}
+set.seed(123)
+lin_comb_bt <- xpred%*%t(beta_thinned)
+lambda_bt <- exp(lin_comb_bt)
+y_pred_bt<- rpois(dim(xpred)[1], lambda_bt)
+```
+
+```{r}
+z <- rasterize(cbind(whitefish.raster$X,whitefish.raster$Y), r, y_pred_bt, fun=mean)
+plot(z, xlim=cbind(min(whitefish.raster$X),max(whitefish.raster$X)),
+     ylim=cbind(min(whitefish.raster$Y),max(whitefish.raster$Y)), main="White fish larvae (counts)")
+
+```
+
+
+
+
+
+Next: 
+
+-  LOO CV for logistic and Poisson regression models
+- LOO CV for model comparison. 
+
+
+
